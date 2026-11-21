@@ -69,6 +69,10 @@ analyzer and current measurement are needed to confirm actual panel behavior.
   options such as `lambda`, `pages`, `rotation`, and `update_interval` are
   supported. `clock_speed` defaults to `8MHZ`, `bit_depth` to 8, and
   `double_buffer` to false.
+- HUB12 `bit_depth` supports 1–12. At 1 bit pixels are black or lit; at 2 or 3 bits grayscale is coarse;
+  an aggressive minimum refresh rate can reduce the number of distinct levels.
+  With `gamma_correct: LINEAR` at 1 bit, use full red (255) or `COLOR_ON` for
+  lit pixels and adjust the overall `brightness` separately.
 - `idle_timeout` sets how long the visible buffer must remain black before DMA
   stops. It defaults to `100ms`; `0ms` stops immediately. Brightness zero always
   blanks immediately.

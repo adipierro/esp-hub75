@@ -90,6 +90,13 @@ double buffering, before descriptor arrays and
 the rest of the application. Start with one panel and a single buffer if memory
 is tight; then add the second row, the full chain and double buffering.
 
+For the eight-by-two layout, the single-buffer waveform allocation is 24,624
+bytes at one bit, 41,040 bytes at two bits and 57,456 bytes at three bits,
+before descriptors. One bit offers black and one lit level. The
+initial low-depth BCM timing uses binary weights; meeting an aggressive minimum
+refresh rate may reduce grayscale resolution. Confirm brightness and grayscale
+on the target hardware.
+
 For the first hardware test, start at 8 MHz with low brightness. Use single
 pixels, row and column stripes, checkerboards, and a grayscale ramp. Check both
 panel rows and the boundaries between panels. With a logic analyzer, confirm

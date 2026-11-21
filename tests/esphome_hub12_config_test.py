@@ -29,6 +29,9 @@ class Hub12ConfigTest(unittest.TestCase):
 
     def test_single_panel_and_two_rows(self):
         self.check_config(TEMPLATE, True)
+        for depth in (1, 2, 3):
+            self.check_config(TEMPLATE.replace("bit_depth: 4", f"bit_depth: {depth}"), True)
+        self.check_config(TEMPLATE.replace("bit_depth: 4", "bit_depth: 0"), False)
         self.check_config(TEMPLATE.replace(f"    library_path: {ROOT / 'components/hub75'}\n", ""), True)
         self.check_config(TEMPLATE.replace("layout_rows: 1", "layout_rows: 2").replace(
             "latch_pins: [GPIO32]", "latch_pins: [GPIO32, GPIO33]"
@@ -77,6 +80,18 @@ class Hub12ConfigTest(unittest.TestCase):
             self.assertIn("set_brightness(0)", main)
             self.assertIn("set_brightness(32)", main)
             self.assertIn(str(ROOT / "components/hub75"), manifest)
+
+    def test_low_depth_codegen(self):
+        for depth in (1, 2, 3):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "test.yaml"
+                path.write_text(TEMPLATE.replace("bit_depth: 4", f"bit_depth: {depth}"))
+                result = subprocess.run([ESPHOME, "compile", "--only-generate", str(path)],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                build = Path(directory) / ".esphome/build/hub12-test"
+                files = list(build.glob("**/CMakeLists.txt")) + list(build.glob("**/platformio.ini"))
+                self.assertTrue(any(f"HUB75_BIT_DEPTH={depth}" in p.read_text() for p in files))
 
     def test_git_external_component_uses_library_from_same_checkout(self):
         with tempfile.TemporaryDirectory() as directory:

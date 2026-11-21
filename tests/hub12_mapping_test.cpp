@@ -17,6 +17,20 @@ static uint32_t reference_word(unsigned x, unsigned y, unsigned columns) {
 }
 
 int main() {
+  assert(hub75::hub12_low_depth_repetitions(0, 0) == 1);
+  assert(hub75::hub12_low_depth_repetitions(1, 0) == 2);
+  assert(hub75::hub12_low_depth_repetitions(2, 0) == 4);
+  for (int depth : {1, 2, 3}) {
+    std::vector<bool> levels(1U << depth);
+    for (int value = 0; value < 1 << depth; ++value) {
+      int duty = 0;
+      for (int bit = 0; bit < depth; ++bit)
+        if (value & (1 << bit)) duty += hub75::hub12_low_depth_repetitions(bit, 0);
+      assert(duty == value);
+      levels[duty] = true;
+    }
+    assert(std::all_of(levels.begin(), levels.end(), [](bool present) { return present; }));
+  }
   for (unsigned columns : {1U, 2U, 6U}) {
     const unsigned width = 32 * columns;
     const unsigned payload = width * 4;

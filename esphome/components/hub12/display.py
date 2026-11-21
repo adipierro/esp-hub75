@@ -125,7 +125,7 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_DOUBLE_BUFFER, default=False): cv.boolean,
             cv.Optional(CONF_BRIGHTNESS, default=128): cv.uint8_t,
-            cv.Optional(CONF_BIT_DEPTH, default=8): cv.int_range(min=4, max=12),
+            cv.Optional(CONF_BIT_DEPTH, default=8): cv.int_range(min=1, max=12),
             cv.Optional(CONF_GAMMA_CORRECT, default="CIE1931"): cv.one_of("LINEAR", "CIE1931", "GAMMA_2_2", upper=True),
             cv.Optional(CONF_CLOCK_SPEED, default="8MHZ"): cv.enum(CLOCK_SPEEDS, upper=True),
             cv.Optional(CONF_CLOCK_PHASE, default=False): cv.boolean,

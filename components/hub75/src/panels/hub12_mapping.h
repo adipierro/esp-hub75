@@ -21,6 +21,12 @@ inline constexpr uint16_t HUB12_LAT2 = 1U << 13;
 // bits shifted between latch pulses. Edge timing still needs panel validation.
 inline constexpr uint32_t hub12_segment_words(uint32_t columns) { return 128U * columns + 2U; }
 
+// Low-depth HUB12 modes need binary weights, so they can represent all
+// nominal levels when no refresh reduction is needed.
+inline constexpr int hub12_low_depth_repetitions(int bit, int transition) {
+  return bit <= transition ? 1 : 1 << (bit - transition);
+}
+
 inline constexpr uint16_t hub12_control_word(unsigned address, unsigned word, unsigned segment, unsigned rows,
                                               bool invert_data) {
   return static_cast<uint16_t>((address << 6) | HUB12_OE | (invert_data ? HUB12_DATA : 0) |

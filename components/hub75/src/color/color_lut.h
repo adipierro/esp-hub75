@@ -112,11 +112,11 @@ constexpr double cie1931(double lightness) {
 
 /**
  * @brief Generate CIE 1931 lookup table at compile time
- * @tparam BitDepth Target bit depth (4-12)
+ * @tparam BitDepth Target bit depth (1-12)
  * @return std::array of 256 values scaled to BitDepth range
  */
 template<uint8_t BitDepth> constexpr std::array<uint16_t, 256> generate_cie1931_lut() {
-  static_assert(BitDepth >= 4 && BitDepth <= 12, "Bit depth must be 4-12");
+  static_assert(BitDepth >= 1 && BitDepth <= 12, "Bit depth must be 1-12");
 
   constexpr uint16_t max_val = (1 << BitDepth) - 1;
   std::array<uint16_t, 256> lut{};
@@ -138,7 +138,7 @@ template<uint8_t BitDepth> constexpr std::array<uint16_t, 256> generate_cie1931_
  * @brief Generate Gamma 2.2 lookup table at compile time
  */
 template<uint8_t BitDepth> constexpr std::array<uint16_t, 256> generate_gamma22_lut() {
-  static_assert(BitDepth >= 4 && BitDepth <= 12, "Bit depth must be 4-12");
+  static_assert(BitDepth >= 1 && BitDepth <= 12, "Bit depth must be 1-12");
 
   constexpr uint16_t max_val = (1 << BitDepth) - 1;
   std::array<uint16_t, 256> lut{};
@@ -158,7 +158,7 @@ template<uint8_t BitDepth> constexpr std::array<uint16_t, 256> generate_gamma22_
  * @brief Generate Linear lookup table at compile time
  */
 template<uint8_t BitDepth> constexpr std::array<uint16_t, 256> generate_linear_lut() {
-  static_assert(BitDepth >= 4 && BitDepth <= 12, "Bit depth must be 4-12");
+  static_assert(BitDepth >= 1 && BitDepth <= 12, "Bit depth must be 1-12");
 
   constexpr uint16_t max_val = (1 << BitDepth) - 1;
   std::array<uint16_t, 256> lut{};
@@ -207,11 +207,11 @@ static constexpr auto LUT = generate_gamma22_lut<HUB75_BIT_DEPTH>();
  * This function adjusts outputs upward to ensure BCM weights never decrease.
  *
  * @param lut Array to adjust in-place (256 elements, already contains gamma-corrected values)
- * @param bit_depth Target bit depth (4-12)
+ * @param bit_depth Target bit depth (1-12)
  * @param lsb_msb_transition The calculated lsbMsbTransitionBit value
  * @return Number of LUT entries that were adjusted
  */
-int adjust_lut_for_bcm(uint16_t *lut, int bit_depth, int lsb_msb_transition);
+int adjust_lut_for_bcm(uint16_t *lut, int bit_depth, int lsb_msb_transition, bool binary_weights = false);
 
 /**
  * @brief Get active lookup table (compile-time selected)

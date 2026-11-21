@@ -10,7 +10,7 @@
 
 namespace hub75 {
 
-int adjust_lut_for_bcm(uint16_t *lut, int bit_depth, int lsb_msb_transition) {
+int adjust_lut_for_bcm(uint16_t *lut, int bit_depth, int lsb_msb_transition, bool binary_weights) {
   const int max_val = (1 << bit_depth) - 1;
   int prev_weight = 0;
   int adjusted_count = 0;
@@ -25,7 +25,7 @@ int adjust_lut_for_bcm(uint16_t *lut, int bit_depth, int lsb_msb_transition) {
       int weight = 0;
       for (int bit = 0; bit < bit_depth; bit++) {
         if (best & (1 << bit)) {
-          weight += (bit <= lsb_msb_transition) ? 1 : (1 << (bit - lsb_msb_transition - 1));
+          weight += (bit <= lsb_msb_transition) ? 1 : (1 << (bit - lsb_msb_transition - (binary_weights ? 0 : 1)));
         }
       }
       if (weight >= prev_weight) {

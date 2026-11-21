@@ -7,7 +7,7 @@
 using namespace hub75;
 int main() {
   for (unsigned cols : {1U, 6U, 8U, 16U}) for (unsigned rows : {1U, 2U})
-    for (unsigned bits : {2U, 3U, 4U, 8U}) for (bool invert : {false, true}) {
+    for (unsigned bits : {1U, 2U, 3U, 4U, 8U}) for (bool invert : {false, true}) {
       const unsigned seg = hub12_segment_words(cols), width = seg * (rows + 1), payload = seg * rows;
       assert(seg % 2 == 0 && payload % 2 == 0);
       for (unsigned address = 0; address < 4; ++address) for (unsigned enabled : {0U, 1U, seg / 2, seg - 4}) {

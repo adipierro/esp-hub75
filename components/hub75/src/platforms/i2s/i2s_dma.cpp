@@ -299,13 +299,12 @@ bool I2sDma::init() {
 
   // Adjust LUT for BCM monotonicity (only needed when lsbMsbTransitionBit > 0)
   // With transition=0, BCM weights are always monotonically non-decreasing
-#if HUB75_GAMMA_MODE == 1 || HUB75_GAMMA_MODE == 2
-  if (lsbMsbTransitionBit_ > 0) {
-    int adjusted = adjust_lut_for_bcm(lut_, bit_depth_, lsbMsbTransitionBit_);
+  if (lsbMsbTransitionBit_ > 0 &&
+      ((config_.hub12.enabled && bit_depth_ < 4) || HUB75_GAMMA_MODE == 1 || HUB75_GAMMA_MODE == 2)) {
+    int adjusted = adjust_lut_for_bcm(lut_, bit_depth_, lsbMsbTransitionBit_, config_.hub12.enabled && bit_depth_ < 4);
     ESP_LOGI(TAG, "Adjusted %d LUT entries for BCM monotonicity (lsbMsbTransitionBit=%d)", adjusted,
              lsbMsbTransitionBit_);
   }
-#endif
 
   // Allocate per-row bit-plane buffers
   if (!allocate_row_buffers()) {
@@ -810,7 +809,12 @@ void I2sDma::calculate_bcm_timings() {
 
   while (true) {
     // Calculate transmissions per row with current transition bit
-    const int transmissions = I2sDma::calculate_bcm_transmissions(bit_depth_, lsbMsbTransitionBit_);
+    int transmissions = I2sDma::calculate_bcm_transmissions(bit_depth_, lsbMsbTransitionBit_);
+    if (config_.hub12.enabled && bit_depth_ < 4) {
+      transmissions = 0;
+      for (int bit = 0; bit < bit_depth_; ++bit)
+        transmissions += hub12_low_depth_repetitions(bit, lsbMsbTransitionBit_);
+    }
 
     // Calculate refresh rate
     const float time_per_row_us = transmissions * buffer_time_us;
@@ -1112,10 +1116,12 @@ bool I2sDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, lldesc_
       uint8_t *const bit_buffer = buffers[row].data + bit * (config_.hub12.enabled ? payload_bytes : bytes_per_bitplane);
 
       // Calculate number of descriptor repetitions for this bit plane
-      const int repetitions =
+      int repetitions =
           (bit <= lsbMsbTransitionBit_)
               ? 1                                         // Base timing for LSBs
               : (1 << (bit - lsbMsbTransitionBit_ - 1));  // BCM weighting: 2^(bit - lsbMsbTransitionBit - 1)
+      if (config_.hub12.enabled && bit_depth_ < 4)
+        repetitions = hub12_low_depth_repetitions(bit, lsbMsbTransitionBit_);
 
       // Create 'repetitions' descriptors, all pointing to the SAME buffer
       // This achieves BCM timing via temporal repetition
@@ -1159,6 +1165,10 @@ bool I2sDma::build_descriptor_chain() {
   descriptor_count_ = 0;
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
+      if (config_.hub12.enabled && bit_depth_ < 4) {
+        descriptor_count_ += hub12_low_depth_repetitions(bit, lsbMsbTransitionBit_);
+        continue;
+      }
       if (bit <= lsbMsbTransitionBit_) {
         descriptor_count_ += 1;  // Base timing
       } else {
