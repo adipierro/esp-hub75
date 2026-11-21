@@ -40,6 +40,9 @@
 #endif
 
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "../../panels/hub12_mapping.h"
 
 static const char *const TAG = "I2sDma";
@@ -52,6 +55,21 @@ static const char *const TAG = "I2sDma";
 #endif
 
 namespace hub75 {
+
+// One I2S peripheral is available to HUB12. The timer and lock are shared
+// for the lifetime of the process so an already-dispatched timer callback
+// cannot access a destroyed driver instance.
+static SemaphoreHandle_t hub12_mutex = nullptr;
+static esp_timer_handle_t hub12_idle_timer = nullptr;
+static I2sDma *hub12_owner = nullptr;
+
+struct Hub12Guard {
+  explicit Hub12Guard(bool enabled) : mutex(enabled ? hub12_mutex : nullptr) {
+    if (mutex) xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+  }
+  ~Hub12Guard() { if (mutex) xSemaphoreGiveRecursive(mutex); }
+  SemaphoreHandle_t mutex;
+};
 
 // HUB75 16-bit word layout for I2S peripheral (same as LCD_CAM)
 // Bit layout: [--|--|OE|LAT|ADDR(5-bit)|R2|G2|B2|R1|G1|B1]
@@ -145,6 +163,21 @@ I2sDma::~I2sDma() { I2sDma::shutdown(); }
 // ============================================================================
 
 bool I2sDma::init() {
+  if (config_.hub12.enabled) {
+    if (!hub12_mutex) hub12_mutex = xSemaphoreCreateRecursiveMutex();
+    if (!hub12_mutex) { ESP_LOGE(TAG, "Failed to allocate HUB12 lock"); return false; }
+    Hub12Guard guard(true);
+    if (hub12_owner && hub12_owner != this) { ESP_LOGE(TAG, "HUB12 I2S already in use"); return false; }
+    if (!hub12_idle_timer) {
+      const esp_timer_create_args_t args = { .callback = hub12_idle_callback, .arg = nullptr,
+                                             .dispatch_method = ESP_TIMER_TASK, .name = "hub12_idle",
+                                             .skip_unhandled_events = false };
+      if (esp_timer_create(&args, &hub12_idle_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create HUB12 idle timer"); return false;
+      }
+    }
+    hub12_owner = this;
+  }
   ESP_LOGI(TAG, "Initializing I2S peripheral in LCD mode...");
   ESP_LOGI(TAG, "Pin config: R1=%d G1=%d B1=%d R2=%d G2=%d B2=%d", config_.pins.r1, config_.pins.g1, config_.pins.b1,
            config_.pins.r2, config_.pins.g2, config_.pins.b2);
@@ -446,6 +479,10 @@ void I2sDma::configure_gpio() {
 bool I2sDma::allocate_row_buffers() {
   size_t pixels_per_bitplane = dma_width_;  // DMA buffer width (all panels chained horizontally)
   size_t buffer_size_per_row = pixels_per_bitplane * bit_depth_ * 2;  // uint16_t = 2 bytes
+  if (config_.hub12.enabled) {
+    const size_t segment = hub12_segment_words(layout_cols_);
+    buffer_size_per_row = (segment * layout_rows_ * bit_depth_ + segment) * 2;
+  }
   size_t total_buffer_size = num_rows_ * buffer_size_per_row;
 
   // Always allocate first buffer (buffer A, index 0)
@@ -508,6 +545,7 @@ bool I2sDma::allocate_row_buffers() {
 }
 
 void I2sDma::start_transfer() {
+  Hub12Guard guard(config_.hub12.enabled);
   if (!i2s_dev_ || !descriptors_[front_idx_]) {
     ESP_LOGE(TAG, "I2S device or descriptors not initialized");
     return;
@@ -563,6 +601,11 @@ void I2sDma::start_transfer() {
 }
 
 void I2sDma::stop_transfer() {
+  Hub12Guard guard(config_.hub12.enabled);
+  if (config_.hub12.enabled && hub12_owner == this && hub12_idle_timer) {
+    esp_timer_stop(hub12_idle_timer);
+    hub12_idle_.cancel();
+  }
   if (!i2s_dev_) {
     return;
   }
@@ -615,17 +658,43 @@ void I2sDma::park_hub12_outputs() {
 }
 
 void I2sDma::update_hub12_refresh() {
+  Hub12Guard guard(config_.hub12.enabled);
   if (!config_.hub12.enabled || !i2s_dev_ || !descriptors_[front_idx_]) return;
   const uint8_t brightness = static_cast<uint8_t>(basis_brightness_ * intensity_);
   if (hub12_refresh_.should_refresh(front_idx_, brightness)) {
+    if (hub12_idle_.pending) {
+      esp_timer_stop(hub12_idle_timer);
+      hub12_idle_.cancel();
+    }
     if (!hub12_dma_active_) start_transfer();
-  } else {
+  } else if (!brightness || config_.hub12.idle_timeout_ms == 0) {
     stop_transfer();
+  } else if (hub12_dma_active_ && !hub12_idle_.pending) {
+    const uint64_t delay_us = static_cast<uint64_t>(config_.hub12.idle_timeout_ms) * 1000;
+    hub12_idle_.arm(esp_timer_get_time(), delay_us);
+    if (esp_timer_start_once(hub12_idle_timer, delay_us) != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to schedule HUB12 idle stop");
+      stop_transfer();
+    }
   }
 }
 
+void I2sDma::hub12_idle_callback(void *) {
+  Hub12Guard guard(true);
+  if (hub12_owner) hub12_owner->hub12_stop_if_due();
+}
+
+void I2sDma::hub12_stop_if_due() {
+  if (!hub12_idle_.due(esp_timer_get_time())) return;
+  hub12_idle_.cancel();
+  const uint8_t brightness = static_cast<uint8_t>(basis_brightness_ * intensity_);
+  if (!hub12_refresh_.should_refresh(front_idx_, brightness)) stop_transfer();
+}
+
 void I2sDma::shutdown() {
+  Hub12Guard guard(config_.hub12.enabled);
   I2sDma::stop_transfer();
+  if (config_.hub12.enabled && hub12_owner == this) hub12_owner = nullptr;
 
   // Free all allocated resources (using array structure)
   for (int i = 0; i < 2; i++) {
@@ -672,6 +741,7 @@ void I2sDma::shutdown() {
 // ============================================================================
 
 void I2sDma::set_basis_brightness(uint8_t brightness) {
+  Hub12Guard guard(config_.hub12.enabled);
   basis_brightness_ = brightness;
 
   if (brightness == 0) {
@@ -686,6 +756,7 @@ void I2sDma::set_basis_brightness(uint8_t brightness) {
 }
 
 void I2sDma::set_intensity(float intensity) {
+  Hub12Guard guard(config_.hub12.enabled);
   // Clamp to valid range (0.0-1.0)
   if (intensity < 0.0f) {
     intensity = 0.0f;
@@ -788,12 +859,18 @@ void I2sDma::initialize_buffer_internal(RowBitPlaneBuffer *buffers) {
 
     for (int bit = 0; bit < bit_depth_; bit++) {
       // Get pointer to this bit plane's buffer
-      uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
+      const size_t stride = config_.hub12.enabled ? hub12_segment_words(layout_cols_) * layout_rows_ : dma_width_;
+      uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * stride * 2));
 
       if (config_.hub12.enabled) {
         const uint16_t segment = hub12_segment_words(layout_cols_);
-        for (uint16_t x = 0; x < dma_width_; ++x)
+        for (uint16_t x = 0; x < stride; ++x)
           buf[fifo_adjust_x(x)] = hub12_control_word(row, x, segment, layout_rows_, config_.hub12.invert_data);
+        if (bit == 0) {
+          uint16_t *display = reinterpret_cast<uint16_t *>(buffers[row].data + stride * bit_depth_ * 2);
+          for (uint16_t x = 0; x < segment; ++x)
+            display[fifo_adjust_x(x)] = hub12_control_word(row, stride + x, segment, layout_rows_, config_.hub12.invert_data);
+        }
         continue;
       }
 
@@ -890,13 +967,11 @@ void I2sDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brig
     const int available = segment - 2 * margin;
     const int enabled = brightness ? std::max(1, available * remap_brightness(brightness) / 255) : 0;
     for (int row = 0; row < num_rows_; ++row) {
-      for (int bit = 0; bit < bit_depth_; ++bit) {
-        uint16_t *buf = (uint16_t *) (buffers[row].data + bit * dma_width_ * 2);
-        for (int x = 0; x < dma_width_; ++x) {
-          uint16_t &word = buf[fifo_adjust_x(x)];
-          if (hub12_display_enabled(x, segment, layout_rows_, enabled)) word &= OE_CLEAR_MASK;
-          else word |= (1 << OE_BIT);
-        }
+      uint16_t *buf = reinterpret_cast<uint16_t *>(buffers[row].data + segment * layout_rows_ * bit_depth_ * 2);
+      for (int x = 0; x < segment; ++x) {
+        uint16_t &word = buf[fifo_adjust_x(x)];
+        if (hub12_display_enabled(segment * layout_rows_ + x, segment, layout_rows_, enabled)) word &= OE_CLEAR_MASK;
+        else word |= (1 << OE_BIT);
       }
     }
     return;
@@ -1032,7 +1107,9 @@ bool I2sDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, lldesc_
   size_t desc_idx = 0;
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
-      uint8_t *const bit_buffer = buffers[row].data + (bit * bytes_per_bitplane);
+      const size_t segment_bytes = hub12_segment_words(layout_cols_) * 2;
+      const size_t payload_bytes = segment_bytes * layout_rows_;
+      uint8_t *const bit_buffer = buffers[row].data + bit * (config_.hub12.enabled ? payload_bytes : bytes_per_bitplane);
 
       // Calculate number of descriptor repetitions for this bit plane
       const int repetitions =
@@ -1043,22 +1120,26 @@ bool I2sDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, lldesc_
       // Create 'repetitions' descriptors, all pointing to the SAME buffer
       // This achieves BCM timing via temporal repetition
       for (int rep = 0; rep < repetitions; rep++) {
-        for (size_t offset = 0; offset < bytes_per_bitplane; offset += 4092) {
-          const size_t length = std::min<size_t>(4092, bytes_per_bitplane - offset);
-          lldesc_t *const desc = &descriptors[desc_idx];
-          desc->size = length;
-          desc->length = length;
-          desc->buf = bit_buffer + offset;
-          desc->eof = 0;  // EOF only on last descriptor
-          desc->sosf = 0;
-          desc->owner = 1;
-          desc->offset = 0;
+        const size_t spans = config_.hub12.enabled ? 2 : 1;
+        for (size_t span = 0; span < spans; ++span) {
+          const size_t span_bytes = config_.hub12.enabled ? (span == 0 ? payload_bytes : segment_bytes) : bytes_per_bitplane;
+          uint8_t *const span_buffer = span == 0 ? bit_buffer : buffers[row].data + payload_bytes * bit_depth_;
+          for (size_t offset = 0; offset < span_bytes; offset += 4092) {
+            const size_t length = std::min<size_t>(4092, span_bytes - offset);
+            lldesc_t *const desc = &descriptors[desc_idx];
+            desc->size = length;
+            desc->length = length;
+            desc->buf = span_buffer + offset;
+            desc->eof = 0;  // EOF only on last descriptor
+            desc->sosf = 0;
+            desc->owner = 1;
+            desc->offset = 0;
 
-          if (desc_idx < descriptor_count_ - 1) {
-            desc->qe.stqe_next = &descriptors[desc_idx + 1];
+            if (desc_idx < descriptor_count_ - 1) {
+              desc->qe.stqe_next = &descriptors[desc_idx + 1];
+            }
+            desc_idx++;
           }
-
-          desc_idx++;
         }
       }
     }
@@ -1086,7 +1167,12 @@ bool I2sDma::build_descriptor_chain() {
     }
   }
 
-  descriptor_count_ *= (static_cast<size_t>(dma_width_) * 2 + 4091) / 4092;
+  if (config_.hub12.enabled) {
+    const size_t segment_bytes = hub12_segment_words(layout_cols_) * 2;
+    descriptor_count_ *= (segment_bytes * layout_rows_ + 4091) / 4092 + (segment_bytes + 4091) / 4092;
+  } else {
+    descriptor_count_ *= (static_cast<size_t>(dma_width_) * 2 + 4091) / 4092;
+  }
 
   // Invariant: num_rows_ is always > 0 (set from panel_height / 2 in constructor)
   assert(num_rows_ > 0 && "num_rows_ must be positive");
@@ -1150,7 +1236,7 @@ HUB75_IRAM void I2sDma::set_hub12_pixel(uint16_t x, uint16_t y, uint16_t level) 
   uint8_t *base = row_buffers_[active_idx_][pos.address].data;
   bool was_lit = false;
   for (int bit = 0; bit < bit_depth_; ++bit) {
-    uint16_t *buf = reinterpret_cast<uint16_t *>(base + bit * dma_width_ * 2);
+    uint16_t *buf = reinterpret_cast<uint16_t *>(base + bit * hub12_segment_words(layout_cols_) * layout_rows_ * 2);
     uint16_t &word = buf[fifo_adjust_x(pos.word)];
     was_lit |= ((word & (1 << R1_BIT)) != 0) != config_.hub12.invert_data;
     const bool on = ((level >> bit) & 1U) != 0;
@@ -1162,6 +1248,7 @@ HUB75_IRAM void I2sDma::set_hub12_pixel(uint16_t x, uint16_t y, uint16_t level) 
 
 HUB75_IRAM void I2sDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t *buffer,
                                     Hub75PixelFormat format, Hub75ColorOrder color_order, bool big_endian) {
+  Hub12Guard guard(config_.hub12.enabled);
   if (config_.hub12.enabled) {
     if (!buffer || !row_buffers_[active_idx_]) return;
     const uint16_t rw = RotationTransform::get_rotated_width(virtual_width_, virtual_height_, rotation_);
@@ -1286,6 +1373,7 @@ HUB75_IRAM void I2sDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_t
 }
 
 void I2sDma::clear() {
+  Hub12Guard guard(config_.hub12.enabled);
   // Always write to active buffer (CPU drawing buffer)
   RowBitPlaneBuffer *target_buffers = row_buffers_[active_idx_];
 
@@ -1296,9 +1384,10 @@ void I2sDma::clear() {
   // Clear RGB bits in all buffers (preserve control bits)
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
-      uint16_t *buf = (uint16_t *) (target_buffers[row].data + (bit * dma_width_ * 2));
+      const uint16_t words = config_.hub12.enabled ? hub12_segment_words(layout_cols_) * layout_rows_ : dma_width_;
+      uint16_t *buf = (uint16_t *) (target_buffers[row].data + (bit * words * 2));
 
-      for (uint16_t x = 0; x < dma_width_; x++) {
+      for (uint16_t x = 0; x < words; x++) {
         // Clear RGB bits, preserve control bits
         if (config_.hub12.enabled && config_.hub12.invert_data)
           buf[fifo_adjust_x(x)] |= (1 << R1_BIT);
@@ -1314,6 +1403,7 @@ void I2sDma::clear() {
 }
 
 HUB75_IRAM void I2sDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t r, uint8_t g, uint8_t b) {
+  Hub12Guard guard(config_.hub12.enabled);
   if (config_.hub12.enabled) {
     if (!row_buffers_[active_idx_]) return;
     const uint16_t rw = RotationTransform::get_rotated_width(virtual_width_, virtual_height_, rotation_);
@@ -1410,17 +1500,15 @@ HUB75_IRAM void I2sDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uin
 }
 
 void I2sDma::flip_buffer() {
+  Hub12Guard guard(config_.hub12.enabled);
   // Single buffer mode: no-op (both indices point to buffer 0)
   if (!row_buffers_[1] || !descriptors_[1]) {
     return;
   }
 
   if (config_.hub12.enabled) {
-    const uint8_t brightness = static_cast<uint8_t>(basis_brightness_ * intensity_);
-    if (!hub12_dma_active_ || !hub12_refresh_.should_refresh(active_idx_, brightness)) {
-      // An all-black target can be blanked immediately. When already idle,
-      // changing the visible buffer requires no DMA descriptor handoff.
-      if (hub12_dma_active_) stop_transfer();
+    if (!hub12_dma_active_) {
+      // When idle, changing the visible buffer needs no descriptor handoff.
       std::swap(front_idx_, active_idx_);
       update_hub12_refresh();
       return;
@@ -1446,6 +1534,8 @@ void I2sDma::flip_buffer() {
 
   // Step 3: Swap indices (after descriptor manipulation)
   std::swap(front_idx_, active_idx_);
+
+  if (config_.hub12.enabled) update_hub12_refresh();
 
   // DMA seamlessly transitions at next frame boundary - no interruption!
 }

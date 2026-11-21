@@ -35,6 +35,11 @@ class Hub12ConfigTest(unittest.TestCase):
         ), True)
         self.check_config(TEMPLATE + "\nscript:\n  - id: turn_dark\n    then:\n"
                           "      - hub12.set_brightness:\n          id: matrix\n          brightness: 0\n", True)
+        self.check_config(TEMPLATE.replace("    bit_depth: 4", "    idle_timeout: 250ms\n    bit_depth: 4") +
+                          "\nscript:\n  - id: cycle_power\n    then:\n"
+                          "      - hub12.turn_off: matrix\n"
+                          "      - hub12.turn_on:\n          id: matrix\n          brightness: 32\n", True)
+        self.check_config(TEMPLATE.replace("    bit_depth: 4", "    idle_timeout: 0ms\n    bit_depth: 4"), True)
 
     def test_rejects_unsupported_or_unsafe_configurations(self):
         s3 = TEMPLATE.replace("variant: esp32", "variant: esp32s3")
@@ -54,6 +59,8 @@ class Hub12ConfigTest(unittest.TestCase):
         text = TEMPLATE.replace("layout_rows: 1", "layout_rows: 2").replace(
             "latch_pins: [GPIO32]", "latch_pins: [GPIO32, GPIO33]"
         )
+        text += "\nscript:\n  - id: cycle_power\n    then:\n      - hub12.turn_off: matrix\n" \
+                "      - hub12.turn_on:\n          id: matrix\n          brightness: 32\n"
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.yaml"
             path.write_text(text)
@@ -66,6 +73,9 @@ class Hub12ConfigTest(unittest.TestCase):
             manifest = (build / "idf_component.yml").read_text()
             self.assertIn(".latch = {32, 33}", main)
             self.assertIn(".enabled = true", main)
+            self.assertIn(".idle_timeout_ms = 100", main)
+            self.assertIn("set_brightness(0)", main)
+            self.assertIn("set_brightness(32)", main)
             self.assertIn(str(ROOT / "components/hub75"), manifest)
 
     def test_git_external_component_uses_library_from_same_checkout(self):

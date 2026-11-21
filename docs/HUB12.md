@@ -47,8 +47,10 @@ the existing driver settings. `layout_rows` must be 1 or 2, and `layout` must be
 `HORIZONTAL`; other geometries and driver chips are rejected.
 
 HUB12 refresh is automatically paused when the visible buffer contains no lit
-pixels after gamma/bit-depth conversion, or when brightness or intensity makes
-the effective brightness zero. OE is forced inactive, DMA and its clock are
+pixels after gamma/bit-depth conversion for `hub12.idle_timeout_ms` (100 ms by
+default; zero disables the delay), or immediately when brightness
+or intensity makes the effective brightness zero. A redraw before the deadline
+cancels the pending stop. OE is forced inactive, DMA and its clock are
 stopped, black data is shifted and latched into every panel row, and control
 signals are held idle. Drawing a visible pixel or restoring brightness resumes
 refresh from a complete frame. In double-buffer mode, drawing or clearing the
@@ -59,7 +61,8 @@ and refresh activity but does not disconnect panel power or eliminate standby
 current. Drawing, brightness, and buffer operations must be serialized by the
 caller, as with the existing DMA buffer API. HUB12 operations can synchronously
 stop or restart I2S and pulse the GPIOs when the visible state changes; call
-them from task context, not from an ISR or with the flash cache disabled.
+them from task context, not from an ISR or with the flash cache disabled. A
+shared ESP timer and mutex remain allocated for reuse after HUB12 shutdown.
 
 The I2S DMA waveform loads each row while OE is blanked, then displays both
 rows together. Each payload has a leading clock, with the latch pulse on its
@@ -79,8 +82,11 @@ can therefore overlap the end of the old frame. When testing, avoid immediately
 redrawing the old front buffer; measure the transition and synchronize its reuse.
 A confirmed DMA completion signal is needed for a general guarantee.
 
-For a six-by-two display at eight-bit depth, the two row-buffer allocations
-alone need about 289 KiB with double buffering, before descriptor arrays and
+The display interval is shared between bit planes for each scan address and
+buffer. For an eight-by-two display at four-bit depth, the single waveform
+buffer is 73,872 bytes, before descriptors. For a six-by-two display at
+eight-bit depth, the two row-buffer allocations alone need about 205 KiB with
+double buffering, before descriptor arrays and
 the rest of the application. Start with one panel and a single buffer if memory
 is tight; then add the second row, the full chain and double buffering.
 

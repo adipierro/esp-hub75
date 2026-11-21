@@ -46,12 +46,11 @@ to the repository. This branch is experimental and is not an upstream release.
 
 The sample cycles every five seconds through black, an 8×8 square on black,
 and a brighter 4×4 square on a dimmer full panel. Linear color correction keeps
-the dim fill distinguishable at the sample's four-bit depth. During black, the library blanks OE,
-stops refresh and latches black data; a logic analyzer and current measurement
-are needed to confirm actual panel behavior. `Color` drawing uses the red
-channel as grayscale intensity. Use `auto_clear_enabled: false` when drawing
-incrementally: repeated full clears can otherwise repeatedly stop and restart
-refresh on a single-buffered display.
+the dim fill distinguishable at the sample's four-bit depth. After 100 ms of
+black, the library blanks OE, stops refresh and latches black data; a logic
+analyzer and current measurement are needed to confirm actual panel behavior.
+`Color` drawing uses the red channel as grayscale intensity. Use
+`auto_clear_enabled: false` when drawing incrementally.
 
 ## Configuration
 
@@ -70,6 +69,9 @@ refresh on a single-buffered display.
   options such as `lambda`, `pages`, `rotation`, and `update_interval` are
   supported. `clock_speed` defaults to `8MHZ`, `bit_depth` to 8, and
   `double_buffer` to false.
+- `idle_timeout` sets how long the visible buffer must remain black before DMA
+  stops. It defaults to `100ms`; `0ms` stops immediately. Brightness zero always
+  blanks immediately.
 - Use `hub12.set_brightness` with a display `id` and a brightness in the range
   0–255 to change brightness from an ESPHome automation.
 
@@ -79,15 +81,18 @@ For example, these scripts blank and restore a display named `matrix`:
 script:
   - id: panel_off
     then:
-      - hub12.set_brightness:
-          id: matrix
-          brightness: 0
+      - hub12.turn_off: matrix
   - id: panel_on
     then:
-      - hub12.set_brightness:
+      - hub12.turn_on:
           id: matrix
           brightness: 32
 ```
+
+`hub12.turn_on` requires the desired brightness (1–255); it does not remember
+the previous value. Both actions use the existing brightness control. The
+display's update loop is disabled while its brightness is zero, and resumes
+when it is turned on.
 
 The underlying ESPHome display is the built-in HUB75 implementation, so setup
 logs identify it as `HUB75` and may list unused RGB pins as `-1`.

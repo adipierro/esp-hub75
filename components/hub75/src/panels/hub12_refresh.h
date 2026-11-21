@@ -3,6 +3,13 @@
 #include <stdint.h>
 
 namespace hub75 {
+struct Hub12IdleDeadline {
+  bool pending = false;
+  int64_t deadline_us = 0;
+  void arm(int64_t now_us, int64_t delay_us) { pending = true; deadline_us = now_us + delay_us; }
+  void cancel() { pending = false; }
+  bool due(int64_t now_us) const { return pending && now_us >= deadline_us; }
+};
 // Tracks the pixels which survive color conversion in each DMA buffer.
 struct Hub12RefreshState {
   uint32_t nonblack[2] = {0, 0};

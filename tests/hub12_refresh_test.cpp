@@ -4,6 +4,18 @@
 #include <initializer_list>
 
 int main() {
+  // A clear followed by a redraw cancels the scheduled idle stop. A stale
+  // callback cannot stop a later black period before its new deadline.
+  hub75::Hub12IdleDeadline idle;
+  idle.arm(1000, 100000);
+  assert(!idle.due(100999));
+  idle.cancel();
+  assert(!idle.due(101000));
+  idle.arm(50000, 100000);
+  assert(!idle.due(101000));
+  assert(idle.due(150000));
+  idle.cancel();
+  assert(!idle.due(160000));
   hub75::Hub12RefreshState state;
   unsigned front = 0;
   unsigned back = 1;

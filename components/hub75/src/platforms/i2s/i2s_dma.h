@@ -125,6 +125,8 @@ class I2sDma : public PlatformDma {
   void set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brightness);  // Helper: set OE for one buffer
   void set_hub12_pixel(uint16_t x, uint16_t y, uint16_t level);
   void update_hub12_refresh();
+  void hub12_stop_if_due();
+  static void hub12_idle_callback(void *arg);
   void park_hub12_outputs();
   bool build_descriptor_chain();
   bool build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, lldesc_t *descriptors);  // Helper: build one chain
@@ -176,6 +178,7 @@ class I2sDma : public PlatformDma {
   Hub12RefreshState hub12_refresh_{};
   bool hub12_dma_active_ = false;
   bool hub12_parked_ = false;
+  Hub12IdleDeadline hub12_idle_{};
 };
 
 }  // namespace hub75

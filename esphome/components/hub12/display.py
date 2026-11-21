@@ -47,6 +47,7 @@ CONF_MIN_REFRESH_RATE = "min_refresh_rate"
 CONF_INVERT_DATA = "invert_data"
 CONF_INVERT_OE = "invert_oe"
 CONF_INVERT_LATCH = "invert_latch"
+CONF_IDLE_TIMEOUT = "idle_timeout"
 
 Hub75Config = cg.global_ns.struct("Hub75Config")
 Hub75Pins = cg.global_ns.struct("Hub75Pins")
@@ -60,6 +61,12 @@ def _library_path(config):
     # Use that same checkout for the IDF component, keeping both revisions
     # together for local sources and sources fetched from Git.
     return Path(__file__).resolve().parents[3] / "components" / "hub75"
+
+
+def _validate_idle_timeout(value):
+    if value.total_milliseconds > 4294967295:
+        raise cv.Invalid("idle_timeout must fit in 32-bit milliseconds")
+    return value
 
 
 def _validate_hub12(config):
@@ -113,6 +120,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_INVERT_DATA, default=False): cv.boolean,
             cv.Optional(CONF_INVERT_OE, default=False): cv.boolean,
             cv.Optional(CONF_INVERT_LATCH, default=False): cv.boolean,
+            cv.Optional(CONF_IDLE_TIMEOUT, default="100ms"): cv.All(
+                cv.positive_time_period_milliseconds, _validate_idle_timeout
+            ),
             cv.Optional(CONF_DOUBLE_BUFFER, default=False): cv.boolean,
             cv.Optional(CONF_BRIGHTNESS, default=128): cv.uint8_t,
             cv.Optional(CONF_BIT_DEPTH, default=8): cv.int_range(min=4, max=12),
@@ -153,6 +163,7 @@ async def to_code(config):
         ("invert_data", config[CONF_INVERT_DATA]),
         ("invert_latch", config[CONF_INVERT_LATCH]),
         ("invert_oe", config[CONF_INVERT_OE]),
+        ("idle_timeout_ms", config[CONF_IDLE_TIMEOUT].total_milliseconds),
     )
     fields = [
         ("panel_width", 32),
@@ -186,5 +197,17 @@ automation.register_apply_action(
         {cv.GenerateID(): cv.use_id(HUB75Display), cv.Required(CONF_BRIGHTNESS): cv.templatable(cv.uint8_t)},
         key=CONF_BRIGHTNESS,
     ),
+    automation.ApplyField(CONF_BRIGHTNESS, "set_brightness", cg.uint8),
+)
+
+automation.register_apply_action(
+    "hub12.turn_off",
+    automation.maybe_simple_id({cv.GenerateID(): cv.use_id(HUB75Display)}),
+    automation.ApplyCall("set_brightness(0)"),
+)
+
+automation.register_apply_action(
+    "hub12.turn_on",
+    cv.Schema({cv.GenerateID(): cv.use_id(HUB75Display), cv.Required(CONF_BRIGHTNESS): cv.templatable(cv.int_range(min=1, max=255))}),
     automation.ApplyField(CONF_BRIGHTNESS, "set_brightness", cg.uint8),
 )

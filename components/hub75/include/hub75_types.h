@@ -169,6 +169,7 @@ struct Hub12Config {
   bool invert_data = false;
   bool invert_latch = false;
   bool invert_oe = false;
+  uint32_t idle_timeout_ms = 100;
 };
 
 /**
