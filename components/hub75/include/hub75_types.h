@@ -161,6 +161,16 @@ struct Hub75Pins {
   int8_t clk = -1;  // Clock
 };
 
+// HUB12 P10 panels use a single serial data line and one latch per panel row.
+struct Hub12Config {
+  bool enabled = false;
+  int8_t data = -1;
+  int8_t latch[2] = {-1, -1};
+  bool invert_data = false;
+  bool invert_latch = false;
+  bool invert_oe = false;
+};
+
 /**
  * @brief Driver configuration
  */
@@ -238,6 +248,9 @@ struct Hub75Config {
 
   // Row decoder / row addressing mode (appended to preserve positional aggregate initialization)
   Hub75RowDecoder row_decoder = Hub75RowDecoder::BINARY;
+
+  // Appended to retain compatibility with existing aggregate initializers.
+  Hub12Config hub12{};
 };
 
 // ============================================================================

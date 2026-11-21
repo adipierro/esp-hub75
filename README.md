@@ -167,6 +167,8 @@ esp-hub75/                    # Repository root
 
 ## Documentation
 
+Experimental monochrome panels: see [HUB12 support](docs/HUB12.md).
+
 ### API Reference & Quick Start
 
 Complete API documentation is available in [components/hub75/README.md](components/hub75/README.md):

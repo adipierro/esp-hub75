@@ -10,6 +10,7 @@
 #include "../drivers/driver_init.h"
 #include "../panels/rotation.h"
 #include "../panels/scan_patterns.h"
+#include "../panels/hub12_mapping.h"
 #include "../platforms/platform_dma.h"
 #include "../platforms/platform_detect.h"
 
@@ -24,6 +25,7 @@
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <driver/gpio.h>
 #include <cstring>
 #include <utility>
 
@@ -79,9 +81,49 @@ bool Hub75Driver::begin() {
     return false;
   }
 
+  if (config_.hub12.enabled) {
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+    ESP_LOGE(TAG, "HUB12 is currently supported only on the original ESP32 I2S backend");
+    return false;
+#else
+    // A single lldesc can carry at most 4092 bytes; I2S handles longer planes in chunks.
+    // Constrain all cached uint16_t dimensions and descriptor offsets before construction.
+    const uint32_t width = 32U * config_.layout_cols;
+    const uint32_t segment = hub12_segment_words(config_.layout_cols);
+    const uint32_t words = segment * (config_.layout_rows + 1U);
+    if (config_.panel_width != 32 || config_.panel_height != 16 || config_.layout_rows > 2 ||
+        config_.layout != Hub75PanelLayout::HORIZONTAL || config_.shift_driver != Hub75ShiftDriver::GENERIC ||
+        (config_.scan_wiring != Hub75ScanWiring::STANDARD_TWO_SCAN &&
+         config_.scan_wiring != Hub75ScanWiring::SCAN_1_4_16PX_HIGH) ||
+        config_.row_decoder != Hub75RowDecoder::BINARY || width > UINT16_MAX || words > UINT16_MAX ||
+        static_cast<uint32_t>(config_.latch_blanking) + 1 >= segment / 2U ||
+        config_.hub12.data < 0 || config_.hub12.latch[0] < 0 || config_.pins.a < 0 || config_.pins.b < 0 ||
+        config_.pins.oe < 0 || config_.pins.clk < 0 || (config_.layout_rows == 2 && config_.hub12.latch[1] < 0)) {
+      ESP_LOGE(TAG, "Invalid HUB12 configuration: expected 32x16, one or two parallel rows and valid pins");
+      return false;
+    }
+    const int pins[] = {config_.hub12.data, config_.hub12.latch[0],
+                        config_.layout_rows == 2 ? config_.hub12.latch[1] : -1,
+                        config_.pins.a, config_.pins.b, config_.pins.oe, config_.pins.clk};
+    for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); ++i) {
+      if (pins[i] < 0) continue;
+      if (!GPIO_IS_VALID_OUTPUT_GPIO(pins[i])) {
+        ESP_LOGE(TAG, "Invalid HUB12 output GPIO: %d", pins[i]);
+        return false;
+      }
+      for (unsigned j = 0; j < i; ++j) {
+        if (pins[i] == pins[j]) {
+          ESP_LOGE(TAG, "HUB12 output GPIO %d is assigned more than once", pins[i]);
+          return false;
+        }
+      }
+    }
+#endif
+  }
+
   // Initialize shift driver chips (panel-level, platform-agnostic)
   // Must happen before DMA starts transmitting data
-  esp_err_t err = DriverInit::initialize(config_);
+  esp_err_t err = config_.hub12.enabled ? ESP_OK : DriverInit::initialize(config_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Shift driver initialization failed: %s", esp_err_to_name(err));
     return false;
@@ -91,6 +133,8 @@ bool Hub75Driver::begin() {
   dma_ = new PlatformDMAImpl(config_);
   if (!dma_ || !dma_->init()) {
     ESP_LOGE(TAG, "Failed to initialize DMA engine");
+    delete dma_;
+    dma_ = nullptr;
     return false;
   }
 

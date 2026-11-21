@@ -23,6 +23,7 @@
 #include <esp_log.h>
 #include <driver/gpio.h>
 #include <esp_rom_gpio.h>
+#include <esp_rom_sys.h>
 // Header location changed in ESP-IDF 5.0
 #if (ESP_IDF_VERSION_MAJOR >= 5)
 #include <esp_private/periph_ctrl.h>
@@ -39,6 +40,7 @@
 #endif
 
 #include <esp_heap_caps.h>
+#include "../../panels/hub12_mapping.h"
 
 static const char *const TAG = "I2sDma";
 
@@ -64,7 +66,8 @@ enum HUB75WordBits : uint16_t {
   // Bits 6-10: Row address (5-bit field, shifted << 6)
   LAT_BIT = 11,  // Latch signal
   OE_BIT = 12,   // Output Enable (active low)
-  // Bits 13-15: Unused
+  HUB12_LAT2_BIT = 13,
+  // Bits 14-15: unused
 };
 
 // Address field (not individual bits)
@@ -112,15 +115,16 @@ I2sDma::I2sDma(const Hub75Config &config)
       virtual_width_(config.panel_width * config.layout_cols),
       virtual_height_(config.panel_height * config.layout_rows),
       // Use helper function to compute DMA width (doubles for four-scan panels)
-      dma_width_(
-          get_effective_dma_width(config.scan_wiring, config.panel_width, config.layout_rows, config.layout_cols)),
+      dma_width_(config.hub12.enabled ? hub12_segment_words(config.layout_cols) * (config.layout_rows + 1U)
+                                     : get_effective_dma_width(config.scan_wiring, config.panel_width, config.layout_rows,
+                                                               config.layout_cols)),
       scan_wiring_(config.scan_wiring),
       layout_(config.layout),
       needs_scan_remap_(config.scan_wiring != Hub75ScanWiring::STANDARD_TWO_SCAN),
       needs_layout_remap_(config.layout != Hub75PanelLayout::HORIZONTAL),
       rotation_(config.rotation),
       // Use helper function to compute num_rows (halves for four-scan panels)
-      num_rows_(get_effective_num_rows(config.scan_wiring, config.panel_height)),
+      num_rows_(config.hub12.enabled ? 4 : get_effective_num_rows(config.scan_wiring, config.panel_height)),
       dma_buffers_{nullptr, nullptr},
       row_buffers_{nullptr, nullptr},
       descriptors_{nullptr, nullptr},
@@ -258,7 +262,7 @@ bool I2sDma::init() {
   calculate_bcm_timings();
 
   // Initialize quadratic brightness remapping coefficients
-  init_brightness_coeffs(dma_width_, config_.latch_blanking);
+  init_brightness_coeffs(config_.hub12.enabled ? hub12_segment_words(layout_cols_) : dma_width_, config_.latch_blanking);
 
   // Adjust LUT for BCM monotonicity (only needed when lsbMsbTransitionBit > 0)
   // With transition=0, BCM weights are always monotonically non-decreasing
@@ -397,13 +401,34 @@ void I2sDma::configure_gpio() {
       -1                 // D15 unused
   };
 
+  if (config_.hub12.enabled) {
+    for (auto &pin : pin_map) pin = -1;
+    pin_map[R1_BIT] = config_.hub12.data;
+    pin_map[ADDR_SHIFT] = config_.pins.a;
+    pin_map[ADDR_SHIFT + 1] = config_.pins.b;
+    pin_map[LAT_BIT] = config_.hub12.latch[0];
+    pin_map[OE_BIT] = config_.pins.oe;
+    if (layout_rows_ == 2) pin_map[HUB12_LAT2_BIT] = config_.hub12.latch[1];
+
+    // Hold the physical output disabled until DMA is running. gpio_set_level
+    // sets the GPIO output latch before it is connected to the pad.
+    esp_rom_gpio_pad_select_gpio(config_.pins.oe);
+    gpio_set_level((gpio_num_t) config_.pins.oe, config_.hub12.invert_oe ? 0 : 1);
+    gpio_set_direction((gpio_num_t) config_.pins.oe, GPIO_MODE_OUTPUT);
+  }
+
   // Initialize all GPIO pins
   for (int i = 0; i < 16; i++) {
     if (pin_map[i] >= 0) {
       esp_rom_gpio_pad_select_gpio(pin_map[i]);
       gpio_set_direction((gpio_num_t) pin_map[i], GPIO_MODE_OUTPUT);
       gpio_set_drive_capability((gpio_num_t) pin_map[i], GPIO_DRIVE_CAP_3);
-      esp_rom_gpio_connect_out_signal(pin_map[i], iomux_signal_base + i, false, false);
+      const bool invert = config_.hub12.enabled &&
+                          ((i == OE_BIT && config_.hub12.invert_oe) ||
+                           ((i == LAT_BIT || i == HUB12_LAT2_BIT) && config_.hub12.invert_latch));
+      if (!(config_.hub12.enabled && i == OE_BIT)) {
+        esp_rom_gpio_connect_out_signal(pin_map[i], iomux_signal_base + i, invert, false);
+      }
     }
   }
 
@@ -455,6 +480,7 @@ bool I2sDma::allocate_row_buffers() {
     dma_buffers_[1] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, MALLOC_CAP_DMA);
     if (!dma_buffers_[1]) {
       ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer B", total_buffer_size);
+      if (config_.hub12.enabled) return false;
       // Continue in single-buffer mode
       ESP_LOGW(TAG, "Continuing in single-buffer mode");
       return true;
@@ -487,6 +513,24 @@ void I2sDma::start_transfer() {
     return;
   }
 
+  if (config_.hub12.enabled) {
+    const uint8_t brightness = static_cast<uint8_t>(basis_brightness_ * intensity_);
+    if (!hub12_refresh_.should_refresh(front_idx_, brightness)) {
+      stop_transfer();
+      return;
+    }
+    if (hub12_dma_active_) return;
+    if (hub12_parked_) configure_gpio();
+    // Always resume from a complete frame, with independent circular chains.
+    for (auto *descriptors : descriptors_) {
+      if (descriptors) descriptors[descriptor_count_ - 1].qe.stqe_next = descriptors;
+    }
+    i2s_dev_->conf.tx_fifo_reset = 1;
+    i2s_dev_->conf.tx_fifo_reset = 0;
+    i2s_dev_->lc_conf.out_rst = 1;
+    i2s_dev_->lc_conf.out_rst = 0;
+  }
+
   ESP_LOGI(TAG, "Starting descriptor-chain DMA:");
   ESP_LOGI(TAG, "  Descriptor count: %zu", descriptor_count_);
   ESP_LOGI(TAG, "  Rows: %d, Bits: %d", num_rows_, bit_depth_);
@@ -504,12 +548,31 @@ void I2sDma::start_transfer() {
   // Start I2S transmission (will run continuously via descriptor loop)
   i2s_dev_->conf.tx_start = 1;
 
+  if (config_.hub12.enabled) {
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+    const int data_signal = I2S0O_DATA_OUT8_IDX;
+#else
+    const int data_signal = (ESP32_I2S_DEVICE == 0) ? I2S0O_DATA_OUT8_IDX : I2S1O_DATA_OUT8_IDX;
+#endif
+    esp_rom_gpio_connect_out_signal(config_.pins.oe, data_signal + OE_BIT, config_.hub12.invert_oe, false);
+    hub12_dma_active_ = true;
+    hub12_parked_ = false;
+  }
+
   ESP_LOGI(TAG, "Descriptor-chain DMA transfer started - running continuously");
 }
 
 void I2sDma::stop_transfer() {
   if (!i2s_dev_) {
     return;
+  }
+  if (config_.hub12.enabled && hub12_parked_) return;
+
+  if (config_.hub12.enabled) {
+    // Disconnect OE from I2S while holding it at the inactive physical level;
+    // otherwise stopping on an enabled sample could leave a row illuminated.
+    gpio_set_level((gpio_num_t) config_.pins.oe, config_.hub12.invert_oe ? 0 : 1);
+    esp_rom_gpio_connect_out_signal(config_.pins.oe, SIG_GPIO_OUT_IDX, false, false);
   }
 
   // Stop I2S transmission
@@ -519,7 +582,46 @@ void I2sDma::stop_transfer() {
   i2s_dev_->out_link.stop = 1;
   i2s_dev_->out_link.start = 0;
 
+  if (config_.hub12.enabled) {
+    hub12_dma_active_ = false;
+    park_hub12_outputs();
+    hub12_parked_ = true;
+  }
+
   ESP_LOGI(TAG, "DMA transfer stopped");
+}
+
+void I2sDma::park_hub12_outputs() {
+  // OE has already been disconnected and forced inactive. Take control of
+  // the remaining signals with inactive latch/clock levels before pulsing.
+  const auto take_pin = [](int pin, bool level) {
+    gpio_set_level(static_cast<gpio_num_t>(pin), level);
+    esp_rom_gpio_connect_out_signal(pin, SIG_GPIO_OUT_IDX, false, false);
+  };
+  take_pin(config_.hub12.latch[0], config_.hub12.invert_latch);
+  if (layout_rows_ == 2) take_pin(config_.hub12.latch[1], config_.hub12.invert_latch);
+  take_pin(config_.pins.clk, false);
+  take_pin(config_.hub12.data, config_.hub12.invert_data);
+  take_pin(config_.pins.a, false);
+  take_pin(config_.pins.b, false);
+  hub12_latch_black(
+      layout_cols_, [this](bool high) { gpio_set_level(static_cast<gpio_num_t>(config_.pins.clk), high); },
+      [this](bool active) {
+        const bool level = active != config_.hub12.invert_latch;
+        gpio_set_level(static_cast<gpio_num_t>(config_.hub12.latch[0]), level);
+        if (layout_rows_ == 2) gpio_set_level(static_cast<gpio_num_t>(config_.hub12.latch[1]), level);
+      },
+      []() { esp_rom_delay_us(1); });
+}
+
+void I2sDma::update_hub12_refresh() {
+  if (!config_.hub12.enabled || !i2s_dev_ || !descriptors_[front_idx_]) return;
+  const uint8_t brightness = static_cast<uint8_t>(basis_brightness_ * intensity_);
+  if (hub12_refresh_.should_refresh(front_idx_, brightness)) {
+    if (!hub12_dma_active_) start_transfer();
+  } else {
+    stop_transfer();
+  }
 }
 
 void I2sDma::shutdown() {
@@ -580,6 +682,7 @@ void I2sDma::set_basis_brightness(uint8_t brightness) {
 
   // Apply brightness change immediately by updating OE bits in DMA buffers
   set_brightness_oe();
+  update_hub12_refresh();
 }
 
 void I2sDma::set_intensity(float intensity) {
@@ -595,6 +698,7 @@ void I2sDma::set_intensity(float intensity) {
 
   // Apply intensity change immediately by updating OE bits in DMA buffers
   set_brightness_oe();
+  update_hub12_refresh();
 }
 
 void I2sDma::set_rotation(Hub75Rotation rotation) { rotation_ = rotation; }
@@ -686,6 +790,13 @@ void I2sDma::initialize_buffer_internal(RowBitPlaneBuffer *buffers) {
       // Get pointer to this bit plane's buffer
       uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
 
+      if (config_.hub12.enabled) {
+        const uint16_t segment = hub12_segment_words(layout_cols_);
+        for (uint16_t x = 0; x < dma_width_; ++x)
+          buf[fifo_adjust_x(x)] = hub12_control_word(row, x, segment, layout_rows_, config_.hub12.invert_data);
+        continue;
+      }
+
       // Row address handling: LSB bit plane uses previous row for LAT settling
       //
       // HUB75 panels need time to process the LAT (latch) signal before the row
@@ -768,6 +879,26 @@ void I2sDma::initialize_blank_buffers() {
 //
 void I2sDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brightness) {
   if (!buffers) {
+    return;
+  }
+
+  if (config_.hub12.enabled) {
+    // Both rows are latched with OE disabled. Display them together during a
+    // separate segment; extra shift clocks cannot change the latched outputs.
+    const int segment = hub12_segment_words(layout_cols_);
+    const int margin = std::min<int>(config_.latch_blanking + 1, segment / 2);
+    const int available = segment - 2 * margin;
+    const int enabled = brightness ? std::max(1, available * remap_brightness(brightness) / 255) : 0;
+    for (int row = 0; row < num_rows_; ++row) {
+      for (int bit = 0; bit < bit_depth_; ++bit) {
+        uint16_t *buf = (uint16_t *) (buffers[row].data + bit * dma_width_ * 2);
+        for (int x = 0; x < dma_width_; ++x) {
+          uint16_t &word = buf[fifo_adjust_x(x)];
+          if (hub12_display_enabled(x, segment, layout_rows_, enabled)) word &= OE_CLEAR_MASK;
+          else word |= (1 << OE_BIT);
+        }
+      }
+    }
     return;
   }
 
@@ -912,21 +1043,23 @@ bool I2sDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, lldesc_
       // Create 'repetitions' descriptors, all pointing to the SAME buffer
       // This achieves BCM timing via temporal repetition
       for (int rep = 0; rep < repetitions; rep++) {
-        lldesc_t *const desc = &descriptors[desc_idx];
-        desc->size = bytes_per_bitplane;
-        desc->length = bytes_per_bitplane;
-        desc->buf = bit_buffer;  // Same buffer for all repetitions
-        desc->eof = 0;           // EOF only on last descriptor
-        desc->sosf = 0;
-        desc->owner = 1;
-        desc->offset = 0;
+        for (size_t offset = 0; offset < bytes_per_bitplane; offset += 4092) {
+          const size_t length = std::min<size_t>(4092, bytes_per_bitplane - offset);
+          lldesc_t *const desc = &descriptors[desc_idx];
+          desc->size = length;
+          desc->length = length;
+          desc->buf = bit_buffer + offset;
+          desc->eof = 0;  // EOF only on last descriptor
+          desc->sosf = 0;
+          desc->owner = 1;
+          desc->offset = 0;
 
-        // Link to next descriptor
-        if (desc_idx < descriptor_count_ - 1) {
-          desc->qe.stqe_next = &descriptors[desc_idx + 1];
+          if (desc_idx < descriptor_count_ - 1) {
+            desc->qe.stqe_next = &descriptors[desc_idx + 1];
+          }
+
+          desc_idx++;
         }
-
-        desc_idx++;
       }
     }
   }
@@ -952,6 +1085,8 @@ bool I2sDma::build_descriptor_chain() {
       }
     }
   }
+
+  descriptor_count_ *= (static_cast<size_t>(dma_width_) * 2 + 4091) / 4092;
 
   // Invariant: num_rows_ is always > 0 (set from panel_height / 2 in constructor)
   assert(num_rows_ > 0 && "num_rows_ must be positive");
@@ -1009,8 +1144,39 @@ bool I2sDma::build_descriptor_chain() {
 // Pixel API
 // ============================================================================
 
+HUB75_IRAM void I2sDma::set_hub12_pixel(uint16_t x, uint16_t y, uint16_t level) {
+  const Coords physical = RotationTransform::apply({x, y}, rotation_, virtual_width_, virtual_height_);
+  const Hub12Position pos = hub12_position(physical.x, physical.y, layout_cols_);
+  uint8_t *base = row_buffers_[active_idx_][pos.address].data;
+  bool was_lit = false;
+  for (int bit = 0; bit < bit_depth_; ++bit) {
+    uint16_t *buf = reinterpret_cast<uint16_t *>(base + bit * dma_width_ * 2);
+    uint16_t &word = buf[fifo_adjust_x(pos.word)];
+    was_lit |= ((word & (1 << R1_BIT)) != 0) != config_.hub12.invert_data;
+    const bool on = ((level >> bit) & 1U) != 0;
+    if (on != config_.hub12.invert_data) word |= (1 << R1_BIT);
+    else word &= ~(1 << R1_BIT);
+  }
+  hub12_refresh_.update_pixel(active_idx_, was_lit, level != 0);
+}
+
 HUB75_IRAM void I2sDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t *buffer,
                                     Hub75PixelFormat format, Hub75ColorOrder color_order, bool big_endian) {
+  if (config_.hub12.enabled) {
+    if (!buffer || !row_buffers_[active_idx_]) return;
+    const uint16_t rw = RotationTransform::get_rotated_width(virtual_width_, virtual_height_, rotation_);
+    const uint16_t rh = RotationTransform::get_rotated_height(virtual_width_, virtual_height_, rotation_);
+    const size_t stride = format == Hub75PixelFormat::RGB888 ? 3 : format == Hub75PixelFormat::RGB565 ? 2 : 4;
+    for (uint32_t dy = 0; dy < h && uint32_t(y) + dy < rh; ++dy) {
+      for (uint32_t dx = 0; dx < w && uint32_t(x) + dx < rw; ++dx) {
+        uint8_t r = 0, g = 0, b = 0;
+        extract_rgb888_from_format(buffer + (dy * w + dx) * stride, 0, format, color_order, big_endian, r, g, b);
+        set_hub12_pixel(x + dx, y + dy, lut_[r]);
+      }
+    }
+    update_hub12_refresh();
+    return;
+  }
   // Always write to active buffer (CPU drawing buffer)
   RowBitPlaneBuffer *target_buffers = row_buffers_[active_idx_];
 
@@ -1134,13 +1300,30 @@ void I2sDma::clear() {
 
       for (uint16_t x = 0; x < dma_width_; x++) {
         // Clear RGB bits, preserve control bits
-        buf[fifo_adjust_x(x)] &= ~RGB_MASK;
+        if (config_.hub12.enabled && config_.hub12.invert_data)
+          buf[fifo_adjust_x(x)] |= (1 << R1_BIT);
+        else
+          buf[fifo_adjust_x(x)] &= ~RGB_MASK;
       }
     }
+  }
+  if (config_.hub12.enabled) {
+    hub12_refresh_.nonblack[active_idx_] = 0;
+    update_hub12_refresh();
   }
 }
 
 HUB75_IRAM void I2sDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t r, uint8_t g, uint8_t b) {
+  if (config_.hub12.enabled) {
+    if (!row_buffers_[active_idx_]) return;
+    const uint16_t rw = RotationTransform::get_rotated_width(virtual_width_, virtual_height_, rotation_);
+    const uint16_t rh = RotationTransform::get_rotated_height(virtual_width_, virtual_height_, rotation_);
+    const uint16_t level = lut_[r];
+    for (uint32_t dy = 0; dy < h && uint32_t(y) + dy < rh; ++dy)
+      for (uint32_t dx = 0; dx < w && uint32_t(x) + dx < rw; ++dx) set_hub12_pixel(x + dx, y + dy, level);
+    update_hub12_refresh();
+    return;
+  }
   // Always write to active buffer (CPU drawing buffer)
   RowBitPlaneBuffer *target_buffers = row_buffers_[active_idx_];
 
@@ -1230,6 +1413,18 @@ void I2sDma::flip_buffer() {
   // Single buffer mode: no-op (both indices point to buffer 0)
   if (!row_buffers_[1] || !descriptors_[1]) {
     return;
+  }
+
+  if (config_.hub12.enabled) {
+    const uint8_t brightness = static_cast<uint8_t>(basis_brightness_ * intensity_);
+    if (!hub12_dma_active_ || !hub12_refresh_.should_refresh(active_idx_, brightness)) {
+      // An all-black target can be blanked immediately. When already idle,
+      // changing the visible buffer requires no DMA descriptor handoff.
+      if (hub12_dma_active_) stop_transfer();
+      std::swap(front_idx_, active_idx_);
+      update_hub12_refresh();
+      return;
+    }
   }
 
   // Seamless descriptor chain redirection (no stop/start!)

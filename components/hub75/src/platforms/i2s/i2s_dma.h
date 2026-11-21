@@ -13,6 +13,7 @@
 #include "hub75_config.h"
 #include "hub75_internal.h"
 #include "../platform_dma.h"
+#include "../../panels/hub12_refresh.h"
 #include <cstddef>
 #include <rom/lldesc.h>
 #include <soc/i2s_struct.h>
@@ -68,8 +69,7 @@ class I2sDma : public PlatformDma {
   /**
    * @brief Resolve clock speed to achievable frequency (I2S constraints)
    *
-   * ESP32: max 10 MHz (80 MHz / 2 / 4)
-   * ESP32-S2: max 20 MHz (160 MHz / 2 / 4)
+   * ESP32 and ESP32-S2: max 20 MHz (160 MHz / 2 / 4).
    */
   HUB75_CONST uint32_t resolve_actual_clock_speed(Hub75ClockSpeed clock_speed) const;
 
@@ -123,6 +123,9 @@ class I2sDma : public PlatformDma {
   void initialize_buffer_internal(RowBitPlaneBuffer *buffers);  // Helper: initialize one buffer set
   void set_brightness_oe();                                     // Set OE bits for BCM control
   void set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brightness);  // Helper: set OE for one buffer
+  void set_hub12_pixel(uint16_t x, uint16_t y, uint16_t level);
+  void update_hub12_refresh();
+  void park_hub12_outputs();
   bool build_descriptor_chain();
   bool build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, lldesc_t *descriptors);  // Helper: build one chain
 
@@ -170,6 +173,9 @@ class I2sDma : public PlatformDma {
   // Brightness control (implementation of base class interface)
   uint8_t basis_brightness_;  // 1-255
   float intensity_;           // 0.0-1.0
+  Hub12RefreshState hub12_refresh_{};
+  bool hub12_dma_active_ = false;
+  bool hub12_parked_ = false;
 };
 
 }  // namespace hub75
